@@ -1,0 +1,89 @@
+;
+; Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+;
+; SPDX-License-Identifier: BSD-3-Clause
+;
+; Full-Duplex 32-bit I2S (64fs BCK) + 256fs MCLK for PCM1808 (ADC) + PCM5102A (DAC)
+;
+
+; 1. System Clock (SCK / MCLK = 256 * fs) output for PCM1808 (GP21)
+.program mclk_output
+.side_set 1
+.wrap_target
+    nop side 0
+    nop side 1
+.wrap
+
+; 2. I2S Master TX + BCK (64 * fs) + LRCK (fs) (GP12=DIN, GP10=BCK, GP11=LRCK)
+.program i2s_tx_master
+.side_set 2
+                    ;        /--- LRCLK (GP11)
+                    ;        |/-- BCLK  (GP10)
+bitloop1:           ;        ||
+    out pins, 1       side 0b10
+    jmp x-- bitloop1  side 0b11
+    out pins, 1       side 0b00
+    set x, 30         side 0b01
+
+bitloop0:
+    out pins, 1       side 0b00
+    jmp x-- bitloop0  side 0b01
+    out pins, 1       side 0b10
+public entry_point:
+    set x, 30         side 0b11
+
+; 3. I2S Slave RX synced to i2s_tx_master (GP9=OUT from PCM1808)
+.program i2s_rx_sync
+public entry_point:
+    nop
+.wrap_target
+    nop
+    in pins, 1
+.wrap
+
+% c-sdk {
+#include "hardware/gpio.h"
+
+static inline void mclk_output_program_init(PIO pio, uint sm, uint offset, uint sck_pin) {
+    pio_gpio_init(pio, sck_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, sck_pin, 1, true);
+
+    pio_sm_config c = mclk_output_program_get_default_config(offset);
+    sm_config_set_sideset_pins(&c, sck_pin);
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+static inline void i2s_tx_master_program_init(PIO pio, uint sm, uint offset, uint dout_pin, uint clock_pin_base) {
+    pio_gpio_init(pio, dout_pin);
+    pio_gpio_init(pio, clock_pin_base);
+    pio_gpio_init(pio, clock_pin_base + 1);
+
+    pio_sm_config c = i2s_tx_master_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, dout_pin, 1);
+    sm_config_set_sideset_pins(&c, clock_pin_base);
+    sm_config_set_out_shift(&c, false, true, 32);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    pio_sm_init(pio, sm, offset, &c);
+
+    uint32_t pin_mask = (1u << dout_pin) | (3u << clock_pin_base);
+    pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
+    pio_sm_set_pins(pio, sm, 0);
+
+    pio_sm_exec(pio, sm, pio_encode_jmp(offset + i2s_tx_master_offset_entry_point));
+}
+
+static inline void i2s_rx_sync_program_init(PIO pio, uint sm, uint offset, uint din_pin) {
+    pio_gpio_init(pio, din_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, din_pin, 1, false);
+    gpio_pull_down(din_pin);
+
+    pio_sm_config c = i2s_rx_sync_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, din_pin);
+    sm_config_set_in_shift(&c, false, true, 32);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    pio_sm_init(pio, sm, offset + i2s_rx_sync_offset_entry_point, &c);
+}
+
+%}
