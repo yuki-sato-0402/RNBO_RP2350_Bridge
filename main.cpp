@@ -70,6 +70,7 @@ namespace RNBO {
 //#define RNBO_LIB_PREFIX common
 
 #include "export/rnbo_source.cpp.h"
+#include "midi_uart.h"
 
 // more custom platform definitions
 
@@ -87,7 +88,7 @@ namespace RNBO {
          * @brief Print a message to stdout or some kind of log
          */
         static void printMessage(const char* message) {
-            printf("%s\n", message);
+            (void)message;
         }
 
         /**
@@ -133,8 +134,12 @@ public:
 // Number of 32-bit words per stereo block (L + R)
 #define WORDS_PER_BUFFER    (SAMPLES_PER_BUFFER * 2)
 
-#define MAX_INPUT_GAIN      1.0f
-#define MAX_OUTPUT_GAIN     1.0f
+// Pre-RNBO gain: moderate boost to bring passive guitar pickup level into optimal DSP operating range
+// without over-driving internal non-linearities (e.g. atan / clamp inside gen~)
+#define MAX_INPUT_GAIN      2.0f
+// Post-RNBO gain: primary volume boost (~+12 dB) after RNBO processing to compensate for
+// internal reverb/allpass attenuation before the PCM5102A DAC limiter
+#define MAX_OUTPUT_GAIN     4.0f
 
 bi_decl(bi_3pins_with_names(I2S_DIN_PIN, "I2S DIN (DAC)", I2S_BCK_PIN, "I2S BCK", I2S_LRCK_PIN, "I2S LRCK"));
 bi_decl(bi_2pins_with_names(I2S_DOUT_PIN, "I2S DOUT (ADC)", I2S_SCK_PIN, "I2S SCK (MCLK)"));
@@ -245,8 +250,6 @@ static inline int32_t float_to_int32(float x) {
 
 int main()
 {
-    stdio_init_all();
-
 	// a memory pool based custom allocator- in no way necessary on this Desktop machine
 	// but quite handy for embedded systems
     const size_t poolSize = 256 * 1024;
@@ -303,6 +306,9 @@ int main()
     adc_gpio_init(OUTPUT_POT_GPIO);
     adc_gpio_init(INPUT_POT_GPIO);
 
+    // Initialize UART0 for MIDI Controller Pico and send initial parameter configurations
+    init_midi_uart(rnbo);
+
     // Start full-duplex I2S audio engine
     init_i2s_full_duplex();
 
@@ -314,6 +320,7 @@ int main()
     int last_out_adc = -100;
 
     int dma_buf_idx = 0;
+    uint32_t block_counter = 0;
 
     while (true) {
         int next_dma_idx = dma_buf_idx ^ 1;
@@ -328,9 +335,16 @@ int main()
         int cpu_buf_idx = dma_buf_idx;
         dma_buf_idx = next_dma_idx;
 
-        // 2. Read potentiometers (Input Gain on GP27 / Output Gain on GP26) and update target gains
-        target_in_gain  = update_pot_target_gain(INPUT_POT_ADC_CH,  MAX_INPUT_GAIN,  &last_in_adc,  target_in_gain);
-        target_out_gain = update_pot_target_gain(OUTPUT_POT_ADC_CH, MAX_OUTPUT_GAIN, &last_out_adc, target_out_gain);
+        // 2. Read potentiometers (alternate Input Gain on GP27 and Output Gain on GP26 every block
+        //    to halve ADC polling overhead) and poll UART MIDI non-blockingly
+        if ((block_counter & 1u) == 0u) {
+            target_in_gain  = update_pot_target_gain(INPUT_POT_ADC_CH,  MAX_INPUT_GAIN,  &last_in_adc,  target_in_gain);
+        } else {
+            target_out_gain = update_pot_target_gain(OUTPUT_POT_ADC_CH, MAX_OUTPUT_GAIN, &last_out_adc, target_out_gain);
+        }
+        block_counter++;
+
+        poll_midi_uart(rnbo);
 
         const int32_t *in_samples  = rx_buffers[cpu_buf_idx];
         int32_t       *out_samples = tx_buffers[cpu_buf_idx];

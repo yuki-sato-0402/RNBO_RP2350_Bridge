@@ -49,6 +49,12 @@ target_link_libraries(baremetal PRIVATE
     hardware_dma
     hardware_adc
     hardware_clocks
+    hardware_uart
 )
+
+# Disable stdio over UART0 and USB so UART0 (GP0/GP1) is dedicated to MIDI
+# and no USB background interrupts disturb real-time I2S DMA
+pico_enable_stdio_usb(baremetal 0)
+pico_enable_stdio_uart(baremetal 0)
 
 pico_add_extra_outputs(baremetal)
