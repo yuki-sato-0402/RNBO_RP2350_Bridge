@@ -22,6 +22,11 @@ Based on [Cycling '74 rnbo.example.baremetal](https://github.com/Cycling74/rnbo.
   - Two hardware potentiometers control **Input Gain** (`GP27 / ADC1`) and **Output Gain** (`GP26 / ADC0`).
   - Combines 8x oversampling, a minimum deadzone, hysteresis (`±12` LSB), and per-sample 1st-order low-pass smoothing to eliminate zipper noise.
 
+- **External MIDI Controller Integration via UART (`midi_uart.h`)**:
+  - Bi-directional **UART0 (`115200 bps`)** communication with an external Raspberry Pi Pico MIDI controller (`pico_midiController_src/`).
+  - Receives **MIDI Control Change (CC)** messages to update RNBO parameters in real time (`setParameterValue`) and transmits **MIDI SysEx** messages (`CONF` / `UPDT`) back to display parameter names and values on the controller's character LCD.
+  - For detailed information about the MIDI controller hardware and architecture, please see **[JUCE_Pico_Bridge](https://github.com/yuki-sato-0402/JUCE_Pico_Bridge)**.
+
 ---
 
 ## Demonstration
@@ -42,6 +47,12 @@ Based on [Cycling '74 rnbo.example.baremetal](https://github.com/Cycling74/rnbo.
   - **I2S ADC Data In (PCM1808 → Pico 2)**: `DOUT` = GP9
   - **I2S Master Clock (Pico 2 → PCM1808)**: `SCK (MCLK, 256fs)` = GP21
   - **Potentiometers (ADC)**: Output Gain = GP26 (`ADC0`), Input Gain = GP27 (`ADC1`)
+  - **UART0 (MIDI Controller Bridge)**: `TX` = GP0 (to Controller `GP1 RX`), `RX` = GP1 (from Controller `GP0 TX`)
+
+### External MIDI Controller (`pico_midiController_src`)
+This project supports an external Raspberry Pi Pico-based MIDI controller (with rotary encoders, switches, and a 16x2 character LCD) connected via **UART (`GP0` / `GP1` at `115200 bps`)**.
+- The CircuitPython source code adapted for UART communication is located in [`pico_midiController_src/`](./pico_midiController_src).
+- **For full details on the MIDI controller hardware, circuit design, and SysEx protocol, please refer to [JUCE_Pico_Bridge](https://github.com/yuki-sato-0402/JUCE_Pico_Bridge).**
 
 ### Software (RNBO Minimal Export + Pico SDK)
 - **DSP Engine**: Cycling '74 RNBO Minimal Export (`export/rnbo_source.cpp.h`) using `gen~`
@@ -64,6 +75,7 @@ To port the original desktop offline demo ([`Cycling74/rnbo.example.baremetal`](
 | **Audio I/O Loop** | Offline loop (`for (int i = 0; i < SAMPLERATE/VECTORSIZE; i++)`) writing to `AudioFile` | Infinite `while (true)` loop synchronized to **PIO + DMA Full-Duplex I2S** transfers every 64 samples | A hardware audio effect must continuously process incoming ADC samples and output DAC samples in real time. |
 | **Sample Format Conversion (`int32_t` ⇔ `float`)** | None (`AudioFile` handles format conversion on desktop) | Normalize incoming 32-bit I2S integers (`int32_t`) to `float (-1.0f..+1.0f)`, and convert processed `float` samples back via `float_to_int32()` | RNBO performs DSP in normalized `float`, whereas the physical I2S wire protocol for PCM1808 and PCM5102A transmits 24-bit/32-bit two's complement signed integers. |
 | **Hardware Gain Control (ADC)** | None | Read `GP27 (ADC1)` for Input Gain and `GP26 (ADC0)` for Output Gain via `update_pot_target_gain()` + per-sample smoothing | Provides physical knob control over input and output levels without potentiometer jitter noise. |
+| **UART MIDI Parameter Control (`midi_uart.h`)** | None | Non-blocking UART0 (`115200 bps`) parser for incoming MIDI CC and outgoing SysEx (`CONF` / `UPDT`), with `stdio` over UART/USB disabled in `CMakeLists.txt` | Allows real-time RNBO parameter editing and LCD feedback via an external Pico MIDI controller without stalling I2S DMA transfers. |
 
 ---
 
