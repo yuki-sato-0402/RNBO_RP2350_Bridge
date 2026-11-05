@@ -95,8 +95,7 @@ To port the original desktop offline demo ([`Cycling74/rnbo.example.baremetal`](
 ### 2. Build the Firmware
 ```bash
 git clone https://github.com/yuki-sato-0402/RNBO_RP2350_Bridge.git
-cd RNBO_RP2350_Bridge
-mkdir build && cd build
+cd RNBO_RP2350_Bridge/build
 cmake -DPICO_BOARD=pico2 ..
 cmake --build .
 ```

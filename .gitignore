@@ -1,3 +1,5 @@
-build/
-export/
+build/*
+!build/.gitkeep
+export/*
+!export/.gitkeep
 .DS_Store
