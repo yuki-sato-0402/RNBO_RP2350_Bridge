@@ -139,7 +139,7 @@ public:
 #define MAX_INPUT_GAIN      2.0f
 // Post-RNBO gain: primary volume boost (~+12 dB) after RNBO processing to compensate for
 // internal reverb/allpass attenuation before the PCM5102A DAC limiter
-#define MAX_OUTPUT_GAIN     4.0f
+#define MAX_OUTPUT_GAIN     2.0f
 
 bi_decl(bi_3pins_with_names(I2S_DIN_PIN, "I2S DIN (DAC)", I2S_BCK_PIN, "I2S BCK", I2S_LRCK_PIN, "I2S LRCK"));
 bi_decl(bi_2pins_with_names(I2S_DOUT_PIN, "I2S DOUT (ADC)", I2S_SCK_PIN, "I2S SCK (MCLK)"));
@@ -252,7 +252,9 @@ int main()
 {
 	// a memory pool based custom allocator- in no way necessary on this Desktop machine
 	// but quite handy for embedded systems
-    const size_t poolSize = 256 * 1024;
+    // Note: 12 delay buffers of 4096 samples (Float64Buffer = 32 KB each) require 384 KB total.
+    // RP2350 has 520 KB SRAM, so 420 KB safely accommodates all 12 buffers plus RNBO overhead.
+    const size_t poolSize = 420 * 1024;
     void* mem = ::malloc(poolSize);
     myPool = tlsf_create_with_pool(mem, poolSize);
 
@@ -295,10 +297,11 @@ int main()
     // processing will also advance the internal millisecond time (and beattime if transport is started)
     rnbo.process(ins.data(), numInputs, outs.data(), numOutputs, VECTORSIZE);
 
-    if (rnbo.getNumParameters() > 0) {
-        rnbo.setParameterValue(0, 40.0f, RNBO::TimeNow);
-        rnbo.setParameterValue(1, 40.0f, RNBO::TimeNow);
-        rnbo.setParameterValue(2, 40.0f, RNBO::TimeNow);
+    // Initialize all parameters to the initialValue defined in the exported RNBO patch
+    for (RNBO::ParameterIndex i = 0; i < rnbo.getNumParameters(); i++) {
+        RNBO::ParameterInfo info;
+        rnbo.getParameterInfo(i, &info);
+        rnbo.setParameterValue(i, info.initialValue, RNBO::TimeNow);
     }
 
     // Initialize ADC for potentiometers
