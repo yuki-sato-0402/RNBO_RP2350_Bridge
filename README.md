@@ -30,8 +30,7 @@ Based on [Cycling '74 rnbo.example.baremetal](https://github.com/Cycling74/rnbo.
 ---
 
 ## Demonstration
-
-*(Video / audio demonstration will be added here.)*
+[Youtube<img width="4028" height="2437" alt="IMG_8849" src="https://github.com/user-attachments/assets/fd768bc3-fe10-452a-84e6-b5565de74e7a" />](https://youtu.be/2DyL3gWUIXQ?si=-n7UQzYYklYH6kul)
 
 ---
 
