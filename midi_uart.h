@@ -15,6 +15,14 @@
 #define MIDI_CC_START       20  // CC number for parameter index 0 (Param i = CC 20 + i)
 #define MIDI_CC_SYNC_REQ    127 // CC 127 (value 127) requests full parameter list sync
 
+// Parameter smoothing configuration (1st-order low-pass filter updated once per audio block)
+#define MAX_SMOOTHED_PARAMS 32
+#define PARAM_SMOOTH_COEFF  0.04f
+
+static RNBO::ParameterValue current_param_val[MAX_SMOOTHED_PARAMS];
+static RNBO::ParameterValue target_param_val[MAX_SMOOTHED_PARAMS];
+static bool                 param_is_discrete[MAX_SMOOTHED_PARAMS];
+
 // Non-blocking UART TX ring buffer to avoid stalling the real-time I2S DMA loop
 #define UART_TX_BUF_SIZE    512
 static uint8_t  uart_tx_buf[UART_TX_BUF_SIZE];
@@ -101,10 +109,8 @@ static void createMessage(const char* dataStr) {
  * If the parameter defines enum/discrete steps, sends the step name or integer;
  * otherwise sends a 2-decimal-place number with optional unit.
  */
-template <typename RNBOT>
-static int append_param_display_value(RNBOT& rnboObj, RNBO::ParameterIndex index,
-                                      const RNBO::ParameterInfo& info, char* buf, int pos, int max_len) {
-    RNBO::ParameterValue val = rnboObj.getParameterValue(index);
+static int append_param_display_value(RNBO::ParameterValue val, const RNBO::ParameterInfo& info,
+                                      char* buf, int pos, int max_len) {
     if (info.enumValues && info.steps > 0) {
         int step = (int)(val + 0.5f);
         if (step >= 0 && step < info.steps && info.enumValues[step]) {
@@ -134,7 +140,10 @@ static void send_parameter_config(RNBOT& rnboObj, RNBO::ParameterIndex index) {
     const char* paramId = rnboObj.getParameterId(index);
     int range = (info.steps > 0) ? info.steps : 0;
 
-    RNBO::ParameterValue normVal = rnboObj.getParameterNormalized(index);
+    RNBO::ParameterValue displayVal = (index < MAX_SMOOTHED_PARAMS)
+        ? target_param_val[index]
+        : rnboObj.getParameterValue(index);
+    RNBO::ParameterValue normVal = rnboObj.convertToNormalizedParameterValue(index, displayVal);
     int midiVal = (int)(normVal * 127.0f + 0.5f);
     if (midiVal < 0)   midiVal = 0;
     if (midiVal > 127) midiVal = 127;
@@ -146,7 +155,7 @@ static void send_parameter_config(RNBOT& rnboObj, RNBO::ParameterIndex index) {
     pos = append_str(msg, pos, sizeof(msg), ",");
     pos = append_str(msg, pos, sizeof(msg), paramId);
     pos = append_str(msg, pos, sizeof(msg), ",");
-    pos = append_param_display_value(rnboObj, index, info, msg, pos, sizeof(msg));
+    pos = append_param_display_value(displayVal, info, msg, pos, sizeof(msg));
     pos = append_str(msg, pos, sizeof(msg), ",");
     pos = append_int(msg, pos, sizeof(msg), range);
     pos = append_str(msg, pos, sizeof(msg), ",");
@@ -159,7 +168,8 @@ static void send_parameter_config(RNBOT& rnboObj, RNBO::ParameterIndex index) {
  * Send parameter value update ("UPDT,<paramId>,<valStr>,<midiVal>")
  */
 template <typename RNBOT>
-static void send_parameter_update(RNBOT& rnboObj, RNBO::ParameterIndex index, int midiVal) {
+static void send_parameter_update(RNBOT& rnboObj, RNBO::ParameterIndex index,
+                                  RNBO::ParameterValue displayVal, int midiVal) {
     RNBO::ParameterInfo info;
     rnboObj.getParameterInfo(index, &info);
 
@@ -170,7 +180,7 @@ static void send_parameter_update(RNBOT& rnboObj, RNBO::ParameterIndex index, in
     pos = append_str(msg, pos, sizeof(msg), "UPDT,");
     pos = append_str(msg, pos, sizeof(msg), paramId);
     pos = append_str(msg, pos, sizeof(msg), ",");
-    pos = append_param_display_value(rnboObj, index, info, msg, pos, sizeof(msg));
+    pos = append_param_display_value(displayVal, info, msg, pos, sizeof(msg));
     pos = append_str(msg, pos, sizeof(msg), ",");
     pos = append_int(msg, pos, sizeof(msg), midiVal);
 
@@ -193,9 +203,16 @@ static void init_midi_uart(RNBOT& rnboObj) {
         (void)uart_getc(MIDI_UART_ID);
     }
 
-    // Send all initial parameter CONF messages and wait for completion before audio DMA starts
+    // Initialize smoothing states from current RNBO parameter values and send initial CONF messages
     RNBO::ParameterIndex numParams = rnboObj.getNumParameters();
     for (RNBO::ParameterIndex i = 0; i < numParams; i++) {
+        if (i < MAX_SMOOTHED_PARAMS) {
+            RNBO::ParameterInfo info;
+            rnboObj.getParameterInfo(i, &info);
+            current_param_val[i] = rnboObj.getParameterValue(i);
+            target_param_val[i]  = current_param_val[i];
+            param_is_discrete[i] = (info.steps > 0);
+        }
         send_parameter_config(rnboObj, i);
         drain_uart_tx_fifo();
     }
@@ -206,9 +223,10 @@ static void init_midi_uart(RNBOT& rnboObj) {
 }
 
 /**
- * Non-blocking UART MIDI parser called once per audio block.
+ * Non-blocking UART MIDI parser and parameter smoother called once per audio block.
  * - Parses incoming 3-byte Control Change messages (0xB0, CC#, Value)
- * - Updates RNBO parameters via setParameterValue() and queues UPDT SysEx responses
+ * - Updates target parameter values and queues UPDT SysEx responses immediately for LCD feedback
+ * - Smoothly interpolates continuous RNBO parameters every audio block to minimize zipper noise
  * - Streams CONF SysEx messages 1 parameter per block if CC 127 sync is requested
  */
 template <typename RNBOT>
@@ -217,9 +235,10 @@ static void poll_midi_uart(RNBOT& rnboObj) {
     static uint8_t midi_data1  = 0;
     static uint8_t midi_state  = 0; // 0: wait status/data1, 1: wait data2
 
+    RNBO::ParameterIndex numParams = rnboObj.getNumParameters();
+
     // If a sync request (CC 127) is active, queue at most 1 parameter per audio block
     // only when the software TX buffer is empty.
-    RNBO::ParameterIndex numParams = rnboObj.getNumParameters();
     if (sync_send_index < numParams && uart_tx_tail == uart_tx_head) {
         send_parameter_config(rnboObj, sync_send_index);
         sync_send_index++;
@@ -263,11 +282,37 @@ static void poll_midi_uart(RNBOT& rnboObj) {
                     if (index < numParams) {
                         RNBO::ParameterValue normVal = (RNBO::ParameterValue)val / 127.0f;
                         RNBO::ParameterValue newValue = rnboObj.convertFromNormalizedParameterValue(index, normVal);
-                        rnboObj.setParameterValue(index, newValue, RNBO::TimeNow);
-                        send_parameter_update(rnboObj, index, (int)val);
+
+                        if (index < MAX_SMOOTHED_PARAMS && !param_is_discrete[index]) {
+                            // Continuous parameter: set target for block-rate smoothing
+                            target_param_val[index] = newValue;
+                        } else {
+                            // Discrete/stepped parameter: update immediately
+                            if (index < MAX_SMOOTHED_PARAMS) {
+                                current_param_val[index] = newValue;
+                                target_param_val[index]  = newValue;
+                            }
+                            rnboObj.setParameterValue(index, newValue, RNBO::TimeNow);
+                        }
+                        // Send target value immediately so the LCD updates without lag
+                        send_parameter_update(rnboObj, index, newValue, (int)val);
                     }
                 }
             }
+        }
+    }
+
+    // Apply 1st-order low-pass smoothing to active continuous parameters once per audio block
+    RNBO::ParameterIndex smoothCount = (numParams < MAX_SMOOTHED_PARAMS) ? numParams : MAX_SMOOTHED_PARAMS;
+    for (RNBO::ParameterIndex i = 0; i < smoothCount; i++) {
+        if (!param_is_discrete[i] && current_param_val[i] != target_param_val[i]) {
+            RNBO::ParameterValue diff = target_param_val[i] - current_param_val[i];
+            if (diff > -0.0005f && diff < 0.0005f) {
+                current_param_val[i] = target_param_val[i];
+            } else {
+                current_param_val[i] += diff * PARAM_SMOOTH_COEFF;
+            }
+            rnboObj.setParameterValue(i, current_param_val[i], RNBO::TimeNow);
         }
     }
 
