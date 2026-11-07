@@ -26,14 +26,15 @@ set(CMAKE_CXX_STANDARD 17)
 pico_sdk_init()
 
 add_executable(baremetal
-    main.cpp
-    tlsf.c
+    src/main.cpp
+    src/tlsf.c
 )
 
-pico_generate_pio_header(baremetal ${CMAKE_CURRENT_LIST_DIR}/audio_i2s_full_duplex.pio)
+pico_generate_pio_header(baremetal ${CMAKE_CURRENT_LIST_DIR}/src/audio_i2s_full_duplex.pio)
 
 target_include_directories(baremetal PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/src
     ${CMAKE_CURRENT_LIST_DIR}/export
     ${CMAKE_CURRENT_LIST_DIR}/export/common
 )
