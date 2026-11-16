@@ -46,9 +46,11 @@ target_compile_options(baremetal PRIVATE
 
 target_link_libraries(baremetal PRIVATE
     pico_stdlib
+    pico_multicore
     hardware_pio
     hardware_dma
     hardware_adc
+    hardware_i2c
     hardware_clocks
     hardware_uart
 )

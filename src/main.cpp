@@ -71,6 +71,7 @@ namespace RNBO {
 
 #include "export/rnbo_source.cpp.h"
 #include "midi_uart.h"
+#include "pot_lcd.h"
 
 // more custom platform definitions
 
@@ -116,7 +117,7 @@ public:
 };
 
 // ==========================================
-// Hardware Pin Configuration (PCM1808 + PCM5102A + Potentiometers)
+// Hardware Pin Configuration (PCM1808 + PCM5102A)
 // ==========================================
 #define I2S_BCK_PIN         10  // GP10 (Shared BCK for PCM1808 & PCM5102A)
 #define I2S_LRCK_PIN        11  // GP11 (Shared LRCK/LCK for PCM1808 & PCM5102A)
@@ -124,22 +125,10 @@ public:
 #define I2S_DOUT_PIN        9   // GP9  (PCM1808 OUT -> Pico 2)
 #define I2S_SCK_PIN         21  // GP21 (Pico 2 -> PCM1808 SCK, 256fs MCLK)
 
-#define OUTPUT_POT_GPIO     26  // GP26 = ADC0 (Output Gain)
-#define OUTPUT_POT_ADC_CH   0
-#define INPUT_POT_GPIO      27  // GP27 = ADC1 (Input Gain)
-#define INPUT_POT_ADC_CH    1
-
 // Number of samples per audio block = RNBO VECTORSIZE (64 samples)
 #define SAMPLES_PER_BUFFER  VECTORSIZE
 // Number of 32-bit words per stereo block (L + R)
 #define WORDS_PER_BUFFER    (SAMPLES_PER_BUFFER * 2)
-
-// Pre-RNBO gain: moderate boost to bring passive guitar pickup level into optimal DSP operating range
-// without over-driving internal non-linearities (e.g. atan / clamp inside gen~)
-#define MAX_INPUT_GAIN      2.0f
-// Post-RNBO gain: primary volume boost (~+12 dB) after RNBO processing to compensate for
-// internal reverb/allpass attenuation before the PCM5102A DAC limiter
-#define MAX_OUTPUT_GAIN     2.0f
 
 bi_decl(bi_3pins_with_names(I2S_DIN_PIN, "I2S DIN (DAC)", I2S_BCK_PIN, "I2S BCK", I2S_LRCK_PIN, "I2S LRCK"));
 bi_decl(bi_2pins_with_names(I2S_DOUT_PIN, "I2S DOUT (ADC)", I2S_SCK_PIN, "I2S SCK (MCLK)"));
@@ -155,37 +144,8 @@ static int dma_chan_tx;
 static int dma_chan_rx;
 
 // ==========================================
-// ADC (Potentiometer) Reading & Full-Duplex I2S Initialization
+// Full-Duplex I2S Initialization
 // ==========================================
-static int read_pot_averaged(uint adc_channel) {
-    adc_select_input(adc_channel);
-    (void)adc_read(); // Dummy read right after switching channels to prevent mux crosstalk
-    uint32_t sum = 0;
-    for (int i = 0; i < 8; i++) {
-        sum += adc_read();
-    }
-    return (int)(sum >> 3); // 0 to 4095
-}
-
-/**
- * Read potentiometer ADC value and update target gain while ignoring small jitter (noise).
- * - Deadzone: Force mute (0.0f) when near minimum (< 16)
- * - Hysteresis: Only update target gain when the reading changes by more than +-12
- */
-static float update_pot_target_gain(uint adc_channel, float max_gain, int *last_adc, float current_target_gain) {
-    int adc_val = read_pot_averaged(adc_channel);
-
-    if (adc_val < 16) {
-        *last_adc = adc_val;
-        return 0.0f;
-    }
-    if (adc_val - *last_adc > 12 || *last_adc - adc_val > 12) {
-        *last_adc = adc_val;
-        return ((float)adc_val / 4095.0f) * max_gain;
-    }
-    return current_target_gain;
-}
-
 static void init_i2s_full_duplex(void) {
     PIO pio = pio0;
 
@@ -304,10 +264,8 @@ int main()
         rnbo.setParameterValue(i, info.initialValue, RNBO::TimeNow);
     }
 
-    // Initialize ADC for potentiometers
-    adc_init();
-    adc_gpio_init(OUTPUT_POT_GPIO);
-    adc_gpio_init(INPUT_POT_GPIO);
+    // Initialize potentiometers (ADC) and LCD1602 (I2C1), and launch Core 1 control/meter task
+    init_pot_and_lcd();
 
     // Initialize UART0 for MIDI Controller Pico and send initial parameter configurations
     init_midi_uart(rnbo);
@@ -315,15 +273,10 @@ int main()
     // Start full-duplex I2S audio engine
     init_i2s_full_duplex();
 
-    float current_in_gain  = 0.0f;
-    float target_in_gain   = 0.0f;
-    float current_out_gain = 0.0f;
-    float target_out_gain  = 0.0f;
-    int last_in_adc  = -100;
-    int last_out_adc = -100;
+    float current_in_gain  = shared_target_in_gain;
+    float current_out_gain = shared_target_out_gain;
 
     int dma_buf_idx = 0;
-    uint32_t block_counter = 0;
 
     while (true) {
         int next_dma_idx = dma_buf_idx ^ 1;
@@ -338,20 +291,18 @@ int main()
         int cpu_buf_idx = dma_buf_idx;
         dma_buf_idx = next_dma_idx;
 
-        // 2. Read potentiometers (alternate Input Gain on GP27 and Output Gain on GP26 every block
-        //    to halve ADC polling overhead) and poll UART MIDI non-blockingly
-        if ((block_counter & 1u) == 0u) {
-            target_in_gain  = update_pot_target_gain(INPUT_POT_ADC_CH,  MAX_INPUT_GAIN,  &last_in_adc,  target_in_gain);
-        } else {
-            target_out_gain = update_pot_target_gain(OUTPUT_POT_ADC_CH, MAX_OUTPUT_GAIN, &last_out_adc, target_out_gain);
-        }
-        block_counter++;
+        // 2. Fetch latest potentiometer target gains from Core 1 and poll UART MIDI non-blockingly
+        float target_in_gain  = shared_target_in_gain;
+        float target_out_gain = shared_target_out_gain;
 
         poll_midi_uart(rnbo);
 
         const int32_t *in_samples  = rx_buffers[cpu_buf_idx];
         int32_t       *out_samples = tx_buffers[cpu_buf_idx];
         const float norm_scale = 1.0f / 2147483648.0f;
+
+        float block_pre_peak  = 0.0f;
+        float block_post_peak = 0.0f;
 
         // 3. Sum L/R I2S inputs to mono, apply smoothed input gain, and feed into both RNBO input channels.
         //    Note: When a mono (TS) guitar plug is inserted into a stereo (TRS) jack, Ring (R) is grounded (0)
@@ -361,6 +312,8 @@ int main()
             float in_l = (float)in_samples[i * 2 + 0] * norm_scale;
             float in_r = (float)in_samples[i * 2 + 1] * norm_scale;
             float mono_in = (in_l + in_r) * current_in_gain;
+            float abs_in = (mono_in >= 0.0f) ? mono_in : -mono_in;
+            if (abs_in > block_pre_peak) block_pre_peak = abs_in;
             if (numInputs >= 1) ins[0][i] = mono_in;
             if (numInputs >= 2) ins[1][i] = mono_in;
         }
@@ -371,11 +324,18 @@ int main()
         // 5. Apply smoothed output gain to RNBO float output buffers and convert back to 32-bit I2S integers
         for (int i = 0; i < VECTORSIZE; i++) {
             current_out_gain += (target_out_gain - current_out_gain) * 0.005f;
-            float out_l = (numOutputs >= 1) ? outs[0][i] : 0.0f;
-            float out_r = (numOutputs >= 2) ? outs[1][i] : out_l;
-            out_samples[i * 2 + 0] = float_to_int32(out_l * current_out_gain);
-            out_samples[i * 2 + 1] = float_to_int32(out_r * current_out_gain);
+            float out_l = ((numOutputs >= 1) ? outs[0][i] : 0.0f) * current_out_gain;
+            float out_r = ((numOutputs >= 2) ? outs[1][i] : outs[0][i]) * current_out_gain;
+            float abs_l = (out_l >= 0.0f) ? out_l : -out_l;
+            float abs_r = (out_r >= 0.0f) ? out_r : -out_r;
+            float max_out = (abs_l > abs_r) ? abs_l : abs_r;
+            if (max_out > block_post_peak) block_post_peak = max_out;
+            out_samples[i * 2 + 0] = float_to_int32(out_l);
+            out_samples[i * 2 + 1] = float_to_int32(out_r);
         }
+
+        // 6. Report Pre-RNBO and Post-RNBO peak levels to Core 1 for the LCD bar graph meter
+        submit_meter_peaks(block_pre_peak, block_post_peak);
     }
 
 	return 0;
