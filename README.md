@@ -106,8 +106,7 @@ To port the original desktop offline demo ([`Cycling74/rnbo.example.baremetal`](
 ---
 
 ## Circuit Diagram
-
-*(Circuit diagram will be added here.)*
+<img width="2307" height="1173" alt="RNBO_RP2350_Bridge_bb" src="https://github.com/user-attachments/assets/cb3cfa79-ab5f-4c8b-852d-28ea0da62900" />
 
 ---
 
