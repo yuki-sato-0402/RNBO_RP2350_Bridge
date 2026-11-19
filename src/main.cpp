@@ -264,14 +264,15 @@ int main()
         rnbo.setParameterValue(i, info.initialValue, RNBO::TimeNow);
     }
 
-    // Initialize potentiometers (ADC) and LCD1602 (I2C1), and launch Core 1 control/meter task
+    // Initialize potentiometers (ADC) and LCD1602 (I2C1)
     init_pot_and_lcd();
 
     // Initialize UART0 for MIDI Controller Pico and send initial parameter configurations
     init_midi_uart(rnbo);
 
-    // Start full-duplex I2S audio engine
+    // Start full-duplex I2S audio engine, then launch Core 1 control/meter task
     init_i2s_full_duplex();
+    start_pot_and_lcd_core1();
 
     float current_in_gain  = shared_target_in_gain;
     float current_out_gain = shared_target_out_gain;
@@ -301,9 +302,6 @@ int main()
         int32_t       *out_samples = tx_buffers[cpu_buf_idx];
         const float norm_scale = 1.0f / 2147483648.0f;
 
-        float block_pre_peak  = 0.0f;
-        float block_post_peak = 0.0f;
-
         // 3. Sum L/R I2S inputs to mono, apply smoothed input gain, and feed into both RNBO input channels.
         //    Note: When a mono (TS) guitar plug is inserted into a stereo (TRS) jack, Ring (R) is grounded (0)
         //    and only Tip (L) carries signal. Summing (L + R) routes the mono signal into both stereo inputs.
@@ -312,8 +310,6 @@ int main()
             float in_l = (float)in_samples[i * 2 + 0] * norm_scale;
             float in_r = (float)in_samples[i * 2 + 1] * norm_scale;
             float mono_in = (in_l + in_r) * current_in_gain;
-            float abs_in = (mono_in >= 0.0f) ? mono_in : -mono_in;
-            if (abs_in > block_pre_peak) block_pre_peak = abs_in;
             if (numInputs >= 1) ins[0][i] = mono_in;
             if (numInputs >= 2) ins[1][i] = mono_in;
         }
@@ -324,18 +320,15 @@ int main()
         // 5. Apply smoothed output gain to RNBO float output buffers and convert back to 32-bit I2S integers
         for (int i = 0; i < VECTORSIZE; i++) {
             current_out_gain += (target_out_gain - current_out_gain) * 0.005f;
-            float out_l = ((numOutputs >= 1) ? outs[0][i] : 0.0f) * current_out_gain;
-            float out_r = ((numOutputs >= 2) ? outs[1][i] : outs[0][i]) * current_out_gain;
-            float abs_l = (out_l >= 0.0f) ? out_l : -out_l;
-            float abs_r = (out_r >= 0.0f) ? out_r : -out_r;
-            float max_out = (abs_l > abs_r) ? abs_l : abs_r;
-            if (max_out > block_post_peak) block_post_peak = max_out;
-            out_samples[i * 2 + 0] = float_to_int32(out_l);
-            out_samples[i * 2 + 1] = float_to_int32(out_r);
+            float out_l = (numOutputs >= 1) ? outs[0][i] : 0.0f;
+            float out_r = (numOutputs >= 2) ? outs[1][i] : out_l;
+            out_samples[i * 2 + 0] = float_to_int32(out_l * current_out_gain);
+            out_samples[i * 2 + 1] = float_to_int32(out_r * current_out_gain);
         }
 
-        // 6. Report Pre-RNBO and Post-RNBO peak levels to Core 1 for the LCD bar graph meter
-        submit_meter_peaks(block_pre_peak, block_post_peak);
+        // 6. Report Pre-RNBO and Post-RNBO levels to Core 1 for the LCD bar graph meter
+        submit_meter_peaks((numInputs >= 1) ? ins[0][0] : 0.0f,
+                           ((numOutputs >= 1) ? outs[0][0] : 0.0f) * current_out_gain);
     }
 
 	return 0;

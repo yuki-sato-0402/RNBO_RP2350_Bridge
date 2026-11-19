@@ -1,11 +1,11 @@
 #ifndef POT_LCD_H
 #define POT_LCD_H
 
-#include <math.h>
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "hardware/adc.h"
 #include "hardware/i2c.h"
+#include "hardware/timer.h"
 
 // ==========================================
 // Potentiometer (ADC) Configuration
@@ -47,14 +47,39 @@ static volatile float shared_post_peak       = 0.0f;
 static uint8_t lcd_i2c_addr = LCD_DEFAULT_ADDR;
 
 // ==========================================
-// Potentiometer Reading Functions
+// SRAM-Resident Helpers for Core 1
+// (Executed 100% from RAM with zero Flash XIP contention and zero timer IRQs on Core 0)
 // ==========================================
-static int read_pot_averaged(uint adc_channel) {
-    adc_select_input(adc_channel);
-    (void)adc_read(); // Dummy read right after switching channels to prevent mux crosstalk
+static void __not_in_flash_func(core1_wait_us)(uint32_t us) {
+    uint32_t start = timer_hw->timerawl;
+    while ((uint32_t)(timer_hw->timerawl - start) < us) {
+        __asm volatile ("nop");
+    }
+}
+
+static inline float __not_in_flash_func(core1_fast_sqrtf)(float x) {
+    if (x <= 0.0f) return 0.0f;
+    float res;
+    __asm volatile ("vsqrt.f32 %0, %1" : "=t"(res) : "t"(x));
+    return res;
+}
+
+static int __not_in_flash_func(read_pot_averaged)(uint adc_channel) {
+    hw_write_masked(&adc_hw->cs, adc_channel << ADC_CS_AINSEL_LSB, ADC_CS_AINSEL_BITS);
+    // Dummy read right after switching channels to prevent mux crosstalk
+    hw_set_bits(&adc_hw->cs, ADC_CS_START_ONCE_BITS);
+    while (!(adc_hw->cs & ADC_CS_READY_BITS)) {
+        __asm volatile ("nop");
+    }
+    (void)adc_hw->result;
+
     uint32_t sum = 0;
     for (int i = 0; i < 8; i++) {
-        sum += adc_read();
+        hw_set_bits(&adc_hw->cs, ADC_CS_START_ONCE_BITS);
+        while (!(adc_hw->cs & ADC_CS_READY_BITS)) {
+            __asm volatile ("nop");
+        }
+        sum += adc_hw->result;
     }
     return (int)(sum >> 3); // 0 to 4095
 }
@@ -64,7 +89,7 @@ static int read_pot_averaged(uint adc_channel) {
  * - Deadzone: Force mute (0.0f) when near minimum (< 16)
  * - Hysteresis: Only update target gain when the reading changes by more than +-12
  */
-static float update_pot_target_gain(uint adc_channel, float max_gain, int *last_adc, float current_target_gain) {
+static float __not_in_flash_func(update_pot_target_gain)(uint adc_channel, float max_gain, int *last_adc, float current_target_gain) {
     int adc_val = read_pot_averaged(adc_channel);
 
     if (adc_val < 16) {
@@ -79,17 +104,31 @@ static float update_pot_target_gain(uint adc_channel, float max_gain, int *last_
 }
 
 // ==========================================
-// LCD1602 I2C Driver & Bar Graph Meter Functions
+// LCD1602 I2C Driver & Bar Graph Meter Functions (SRAM-Resident)
 // ==========================================
-static inline void lcd_i2c_send_nibble(uint8_t nibble_with_mode) {
-    uint8_t buf[2];
-    buf[0] = nibble_with_mode | LCD_EN_BIT | LCD_BL_BIT;
-    buf[1] = nibble_with_mode | LCD_BL_BIT;
-    i2c_write_timeout_us(LCD_I2C_INST, lcd_i2c_addr, buf, 2, false, 2000);
-    sleep_us(50);
+static void __not_in_flash_func(lcd_i2c_send_nibble)(uint8_t nibble_with_mode) {
+    i2c_hw_t *hw = i2c_get_hw(LCD_I2C_INST);
+    uint8_t b0 = nibble_with_mode | LCD_EN_BIT | LCD_BL_BIT;
+    uint8_t b1 = nibble_with_mode | LCD_BL_BIT;
+
+    uint32_t start = timer_hw->timerawl;
+    while (!(hw->status & I2C_IC_STATUS_TFNF_BITS)) {
+        if ((uint32_t)(timer_hw->timerawl - start) > 2000) return;
+    }
+    hw->data_cmd = b0;
+
+    while (!(hw->status & I2C_IC_STATUS_TFNF_BITS)) {
+        if ((uint32_t)(timer_hw->timerawl - start) > 2000) return;
+    }
+    hw->data_cmd = b1 | I2C_IC_DATA_CMD_STOP_BITS;
+
+    while ((hw->status & (I2C_IC_STATUS_TFE_BITS | I2C_IC_STATUS_ACTIVITY_BITS)) != I2C_IC_STATUS_TFE_BITS) {
+        if ((uint32_t)(timer_hw->timerawl - start) > 2000) return;
+    }
+    core1_wait_us(50);
 }
 
-static void lcd_write_byte(uint8_t bits, uint8_t mode) {
+static void __not_in_flash_func(lcd_write_byte)(uint8_t bits, uint8_t mode) {
     lcd_i2c_send_nibble((bits & 0xF0) | mode);
     lcd_i2c_send_nibble(((bits << 4) & 0xF0) | mode);
 }
@@ -122,7 +161,7 @@ static void lcd_init_hardware(void) {
     gpio_pull_up(LCD_SDA_PIN);
     gpio_pull_up(LCD_SCL_PIN);
 
-    sleep_ms(50);
+    core1_wait_us(50000);
 
     // Probe 0x27 first, then fallback to 0x3F if needed
     uint8_t dummy = LCD_BL_BIT;
@@ -132,14 +171,20 @@ static void lcd_init_hardware(void) {
         lcd_i2c_addr = 0x3F;
     }
 
+    // Configure hardware I2C target address once for direct register writes
+    i2c_hw_t *hw = i2c_get_hw(LCD_I2C_INST);
+    hw->enable = 0;
+    hw->tar = lcd_i2c_addr;
+    hw->enable = 1;
+
     // Standard HD44780 4-bit initialization sequence (same as code.py)
     const uint8_t init_cmds[] = {0x33, 0x32, 0x06, 0x0C, 0x28, 0x01};
     for (size_t i = 0; i < sizeof(init_cmds); i++) {
         lcd_write_byte(init_cmds[i], LCD_MODE_CMD);
         if (init_cmds[i] == 0x01) {
-            sleep_ms(2);
+            core1_wait_us(2000);
         } else {
-            sleep_us(150);
+            core1_wait_us(150);
         }
     }
 
@@ -158,13 +203,8 @@ static void lcd_init_hardware(void) {
 /**
  * Draw a 12-character (60-subpixel) bar graph starting at column 4 of the given line.
  */
-static void lcd_draw_meter_bar(uint8_t line_addr, float level) {
-    if (level < 0.0f) level = 0.0f;
-    if (level > 1.0f) level = 1.0f;
-
-    // Apply square-root perceptual scaling so low/mid levels are clearly visible
-    float curved = sqrtf(level);
-    int segments = (int)(curved * 60.0f + 0.5f); // 0 to 60 sub-pixel segments across 12 chars
+static void __not_in_flash_func(lcd_draw_meter_bar)(uint8_t line_addr, int segments) {
+    if (segments < 0)  segments = 0;
     if (segments > 60) segments = 60;
 
     // Position cursor right after "IN :" / "OUT:" (column 4)
@@ -185,18 +225,18 @@ static void lcd_draw_meter_bar(uint8_t line_addr, float level) {
 }
 
 // ==========================================
-// Core 1 Entry: Potentiometer Polling & LCD Level Meter
+// Core 1 Entry: Potentiometer Polling & LCD Level Meter (100% SRAM-Resident)
 // ==========================================
-static void core1_pot_and_lcd_entry(void) {
+static void __not_in_flash_func(core1_pot_and_lcd_entry)(void) {
     int last_in_adc  = -100;
     int last_out_adc = -100;
-    float local_target_in  = 0.0f;
-    float local_target_out = 0.0f;
+    float local_target_in  = shared_target_in_gain;
+    float local_target_out = shared_target_out_gain;
 
     float display_pre_level  = 0.0f;
     float display_post_level = 0.0f;
-    int last_pre_segments  = -1;
-    int last_post_segments = -1;
+    int last_pre_segments  = 0;
+    int last_post_segments = 0;
 
     uint32_t loop_count = 0;
 
@@ -211,7 +251,7 @@ static void core1_pot_and_lcd_entry(void) {
         if (++loop_count >= 6) {
             loop_count = 0;
 
-            // Atomically grab and reset peak accumulators from Core 0
+            // Grab and reset peak accumulators from Core 0
             float raw_pre  = shared_pre_peak;
             shared_pre_peak = 0.0f;
             float raw_post = shared_post_peak;
@@ -235,26 +275,25 @@ static void core1_pot_and_lcd_entry(void) {
             // Only transmit over I2C when the visible bar segment count actually changes
             float pre_clamped  = (display_pre_level  > 1.0f) ? 1.0f : display_pre_level;
             float post_clamped = (display_post_level > 1.0f) ? 1.0f : display_post_level;
-            int cur_pre_seg  = (int)(sqrtf(pre_clamped)  * 60.0f + 0.5f);
-            int cur_post_seg = (int)(sqrtf(post_clamped) * 60.0f + 0.5f);
+            int cur_pre_seg  = (int)(core1_fast_sqrtf(pre_clamped)  * 60.0f + 0.5f);
+            int cur_post_seg = (int)(core1_fast_sqrtf(post_clamped) * 60.0f + 0.5f);
 
             if (cur_pre_seg != last_pre_segments) {
-                lcd_draw_meter_bar(LCD_LINE1_ADDR, pre_clamped);
+                lcd_draw_meter_bar(LCD_LINE1_ADDR, cur_pre_seg);
                 last_pre_segments = cur_pre_seg;
             }
             if (cur_post_seg != last_post_segments) {
-                lcd_draw_meter_bar(LCD_LINE2_ADDR, post_clamped);
+                lcd_draw_meter_bar(LCD_LINE2_ADDR, cur_post_seg);
                 last_post_segments = cur_post_seg;
             }
         }
 
-        sleep_ms(5);
+        core1_wait_us(5000);
     }
 }
 
 /**
- * Initialize ADC potentiometers and I2C1 LCD1602, then launch the Core 1 background task.
- * Call this once from main() before init_i2s_full_duplex().
+ * Initialize ADC potentiometers and I2C1 LCD1602 before audio starts.
  */
 static void init_pot_and_lcd(void) {
     adc_init();
@@ -268,8 +307,12 @@ static void init_pot_and_lcd(void) {
     shared_target_out_gain = update_pot_target_gain(OUTPUT_POT_ADC_CH, MAX_OUTPUT_GAIN, &dummy_out, 0.0f);
 
     lcd_init_hardware();
+}
 
-    // Launch potentiometer polling + LCD level meter rendering on Core 1
+/**
+ * Launch Core 1 background task after I2S DMA has started cleanly.
+ */
+static void start_pot_and_lcd_core1(void) {
     multicore_launch_core1(core1_pot_and_lcd_entry);
 }
 
@@ -277,6 +320,8 @@ static void init_pot_and_lcd(void) {
  * Called by Core 0 once per 64-sample audio block to report peak Pre-RNBO and Post-RNBO levels.
  */
 static inline void submit_meter_peaks(float block_pre_peak, float block_post_peak) {
+    if (block_pre_peak < 0.0f)  block_pre_peak  = -block_pre_peak;
+    if (block_post_peak < 0.0f) block_post_peak = -block_post_peak;
     if (block_pre_peak > shared_pre_peak) {
         shared_pre_peak = block_pre_peak;
     }
